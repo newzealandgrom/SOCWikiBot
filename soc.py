@@ -1,16 +1,29 @@
+#!/usr/bin/env python3
+"""
+SOC Telegram Bot - Simple single script version
+Run: python3 bot_interactive.py
+
+Set environment variables:
+export TELEGRAM_TOKEN="your_token"
+export VIRUSTOTAL_API_KEY="your_key"
+export ABUSEIPDB_API_KEY="your_key"
+export OWNER_ID="your_telegram_id"
+"""
+
 import logging
 import os
 import json
-import requests
-import time
-import socket
+import asyncio
+import aiohttp
 import whois
 import ipaddress
 import re
 import pickle
 import os.path
+import getpass
 from datetime import datetime
 from threading import Lock
+from typing import Optional, Dict, Any
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -32,17 +45,162 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
-# ======================
-#    API ключи и токены
-# ======================
-VIRUSTOTAL_API_KEY = "ВАШ VIRUSTOTAL_API_KEY"
-ABUSEIPDB_API_KEY = (
-    "ВАШ ABUSEIPDB_API_KEY"
-)
-TELEGRAM_TOKEN = "ВАШ TELEGRAM_TOKEN"
+def setup_credentials():
+    """Настройка учетных данных (интерактивная или через переменные окружения)"""
+    config_file = ".bot_config.json"
+    
+    # Проверяем переменные окружения сначала
+    env_config = {}
+    if os.getenv('VIRUSTOTAL_API_KEY'):
+        env_config['VIRUSTOTAL_API_KEY'] = os.getenv('VIRUSTOTAL_API_KEY')
+    if os.getenv('ABUSEIPDB_API_KEY'):
+        env_config['ABUSEIPDB_API_KEY'] = os.getenv('ABUSEIPDB_API_KEY')
+    if os.getenv('TELEGRAM_TOKEN'):
+        env_config['TELEGRAM_TOKEN'] = os.getenv('TELEGRAM_TOKEN')
+    if os.getenv('OWNER_ID'):
+        try:
+            env_config['OWNER_ID'] = int(os.getenv('OWNER_ID'))
+        except ValueError:
+            pass
+    
+    # Если все переменные окружения установлены, используем их
+    if len(env_config) == 4:
+        print("✅ Используется конфигурация из переменных окружения")
+        return env_config
+    
+    # Проверяем существующий конфиг
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+                print("✅ Найден существующий конфигурационный файл.")
+                
+                # Проверяем, есть ли интерактивный режим (tty)
+                try:
+                    import sys
+                    if not sys.stdin.isatty():
+                        print("🤖 Запуск в неинтерактивном режиме, используется существующий конфиг")
+                        return config
+                except:
+                    return config
+                
+                try:
+                    use_existing = input("Использовать существующие настройки? (y/n): ").lower().strip()
+                    if use_existing in ['y', 'yes', 'да', '']:
+                        return config
+                except (EOFError, KeyboardInterrupt):
+                    return config
+        except Exception as e:
+            print(f"⚠️ Ошибка чтения конфига: {e}")
+    
+    # Проверяем интерактивный режим
+    try:
+        import sys
+        if not sys.stdin.isatty():
+            print("❌ Не найдена конфигурация и нет интерактивного терминала")
+            print("Установите переменные окружения:")
+            print("export TELEGRAM_TOKEN='your_bot_token'")
+            print("export VIRUSTOTAL_API_KEY='your_vt_key'") 
+            print("export ABUSEIPDB_API_KEY='your_abuse_key'")
+            print("export OWNER_ID='your_telegram_id'")
+            print("Или создайте файл .bot_config.json с конфигурацией")
+            return None
+    except:
+        print("❌ Нет конфигурации. Установите переменные окружения или создайте .bot_config.json")
+        return None
+    
+    print("🔧 Настройка SOC Telegram Bot")
+    print("=" * 50)
+    
+    config = {}
+    
+    # VirusTotal API Key
+    print("\n🔍 VirusTotal API Key:")
+    print("Получить можно на: https://www.virustotal.com/gui/my-apikey")
+    while True:
+        try:
+            vt_key = input("Введите VirusTotal API Key: ").strip()
+            if len(vt_key) >= 64:  # VirusTotal keys are 64 chars
+                config['VIRUSTOTAL_API_KEY'] = vt_key
+                break
+            else:
+                print("❌ Некорректный API ключ. Должен быть длиной 64 символа.")
+        except (EOFError, KeyboardInterrupt):
+            print("\n❌ Настройка прервана")
+            return None
+    
+    # AbuseIPDB API Key
+    print("\n🛡️ AbuseIPDB API Key:")
+    print("Получить можно на: https://www.abuseipdb.com/api")
+    while True:
+        try:
+            abuse_key = input("Введите AbuseIPDB API Key: ").strip()
+            if len(abuse_key) >= 80:  # AbuseIPDB keys are 80 chars
+                config['ABUSEIPDB_API_KEY'] = abuse_key
+                break
+            else:
+                print("❌ Некорректный API ключ. Должен быть длиной 80 символов.")
+        except (EOFError, KeyboardInterrupt):
+            print("\n❌ Настройка прервана")
+            return None
+    
+    # Telegram Bot Token
+    print("\n🤖 Telegram Bot Token:")
+    print("Получить можно у @BotFather в Telegram")
+    while True:
+        try:
+            tg_token = input("Введите Telegram Bot Token: ").strip()
+            if ':' in tg_token and len(tg_token.split(':')[1]) >= 30:
+                config['TELEGRAM_TOKEN'] = tg_token
+                break
+            else:
+                print("❌ Некорректный токен. Формат: 123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11")
+        except (EOFError, KeyboardInterrupt):
+            print("\n❌ Настройка прервана")
+            return None
+    
+    # Owner ID
+    print("\n👤 Owner ID (ваш Telegram ID):")
+    print("Узнать можно у @userinfobot в Telegram")
+    while True:
+        try:
+            owner_input = input("Введите ваш Telegram User ID: ").strip()
+            owner_id = int(owner_input)
+            if owner_id > 0:
+                config['OWNER_ID'] = owner_id
+                break
+            else:
+                print("❌ ID должен быть положительным числом.")
+        except ValueError:
+            print("❌ Введите корректное число.")
+        except (EOFError, KeyboardInterrupt):
+            print("\n❌ Настройка прервана")
+            return None
+    
+    # Сохраняем конфиг
+    try:
+        with open(config_file, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f"\n✅ Конфигурация сохранена в {config_file}")
+        print("🔒 Этот файл содержит ваши API ключи. Не делитесь им!")
+        
+        # Создаем .gitignore если его нет
+        if not os.path.exists('.gitignore'):
+            with open('.gitignore', 'w') as f:
+                f.write(".bot_config.json\n*.pkl\n__pycache__/\n*.log\n")
+            print("✅ Создан .gitignore для защиты ваших ключей")
+        
+    except Exception as e:
+        print(f"❌ Ошибка сохранения конфига: {e}")
+        return None
+    
+    return config
 
-# ID владельца бота (основной администратор)
-OWNER_ID = ВАШ OWNER_ID  # Telegram ID владельца бота
+# Global variables to be set after config loading
+VIRUSTOTAL_API_KEY = None
+ABUSEIPDB_API_KEY = None
+TELEGRAM_TOKEN = None
+OWNER_ID = None
 
 # ======================
 #   Управление доступом
@@ -55,9 +213,9 @@ if os.path.exists(ALLOWED_USERS_FILE):
     try:
         with open(ALLOWED_USERS_FILE, "rb") as f:
             ALLOWED_USERS = pickle.load(f)
-            print(f"Загружены авторизованные пользователи: {ALLOWED_USERS}")
+            logging.info(f"Загружены авторизованные пользователи: {ALLOWED_USERS}")
     except Exception as e:
-        print(f"Не удалось загрузить список пользователей: {e}")
+        logging.error(f"Не удалось загрузить список пользователей: {e}")
 
 # ======================
 #   Кэш для MITRE ATT&CK
@@ -75,49 +233,101 @@ MITRE_CACHE = {
 if os.path.exists(MITRE_CACHE_FILE):
     try:
         os.remove(MITRE_CACHE_FILE)
-        print("Удален старый кэш MITRE для избежания ошибок структуры данных")
+        logging.info("Удален старый кэш MITRE для избежания ошибок структуры данных")
     except Exception as e:
-        print(f"Не удалось удалить старый кэш MITRE: {e}")
+        logging.error(f"Не удалось удалить старый кэш MITRE: {e}")
 
 # ======================
 #  Вспомогательные функции
 # ======================
 
+def sanitize_input(text: str, max_length: int = 200) -> str:
+    """Санитаризация пользовательского ввода"""
+    if not isinstance(text, str):
+        return ""
+    # Удаляем опасные символы и ограничиваем длину
+    sanitized = re.sub(r'[<>"\'\/\\]', '', text.strip())
+    return sanitized[:max_length]
+
+def validate_ip(ip_str: str) -> bool:
+    """Проверка корректности IP-адреса"""
+    try:
+        ipaddress.ip_address(ip_str)
+        return True
+    except ValueError:
+        return False
+
+def validate_domain(domain: str) -> bool:
+    """Проверка корректности доменного имени"""
+    domain_pattern = re.compile(
+        r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+'  # домен
+        r'[a-zA-Z]{2,}$'  # TLD
+    )
+    return bool(domain_pattern.match(domain)) and len(domain) <= 253
+
+def validate_url(url: str) -> bool:
+    """Проверка корректности URL"""
+    url_pattern = re.compile(
+        r'^https?://'  # http:// или https://
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+'  # домен
+        r'(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'  # TLD
+        r'localhost|'  # localhost
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # IP
+        r'(?::\d+)?'  # порт
+        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    return bool(url_pattern.match(url)) and len(url) <= 2000
+
+def validate_hash(hash_str: str) -> bool:
+    """Проверка корректности хеша (MD5, SHA1, SHA256)"""
+    hash_patterns = {
+        32: r'^[a-fA-F0-9]{32}$',  # MD5
+        40: r'^[a-fA-F0-9]{40}$',  # SHA1
+        64: r'^[a-fA-F0-9]{64}$'   # SHA256
+    }
+    hash_len = len(hash_str)
+    if hash_len in hash_patterns:
+        return bool(re.match(hash_patterns[hash_len], hash_str))
+    return False
+
+async def rate_limit_check(user_id: int, action: str) -> bool:
+    """Простая проверка rate limiting (можно расширить)"""
+    # В данной реализации - заглушка, можно добавить Redis или SQLite для хранения
+    return True
 
 async def check_access(update: Update) -> bool:
     """Проверяет, имеет ли пользователь доступ к боту."""
     user_id = update.effective_user.id
+    logging.info(f"User {user_id} trying to access bot. Owner ID: {OWNER_ID}")
+    
     if user_id != OWNER_ID and user_id not in ALLOWED_USERS:
         # Если пользователь не в списке, отказываем в доступе
         await update.message.reply_text(
-            "⛔️ Этот бот является приватным и доступен только авторизованным пользователям. Доступ запрещен."
+            f"⛔️ Этот бот является приватным. Ваш ID: {user_id}. Обратитесь к владельцу для получения доступа."
         )
         logging.warning(f"Попытка доступа от неавторизованного пользователя: {user_id}")
         return False
     return True
-
 
 def save_allowed_users():
     """Сохраняет список ALLOWED_USERS в файл."""
     try:
         with open(ALLOWED_USERS_FILE, "wb") as f:
             pickle.dump(ALLOWED_USERS, f)
-            print(f"Список пользователей сохранен ({len(ALLOWED_USERS)} записей).")
+            logging.info(f"Список пользователей сохранен ({len(ALLOWED_USERS)} записей).")
     except Exception as e:
-        print(f"Ошибка при сохранении списка пользователей: {e}")
-
+        logging.error(f"Ошибка при сохранении списка пользователей: {e}")
 
 def save_mitre_cache():
     """Сохраняет кэш MITRE в файл."""
     try:
-        with open(MITRE_CACHE_FILE, "wb") as f:
-            pickle.dump(MITRE_CACHE, f)
-            print(
-                f"MITRE cache saved, tactics: {len(MITRE_CACHE['tactics'])}, techniques: {len(MITRE_CACHE['techniques'])}"
-            )
+        with mitre_cache_lock:
+            with open(MITRE_CACHE_FILE, "wb") as f:
+                pickle.dump(MITRE_CACHE, f)
+                logging.info(
+                    f"MITRE cache saved, tactics: {len(MITRE_CACHE['tactics'])}, techniques: {len(MITRE_CACHE['techniques'])}"
+                )
     except Exception as e:
-        print(f"Error saving MITRE cache: {e}")
-
+        logging.error(f"Error saving MITRE cache: {e}")
 
 def get_tactics_for_technique(technique_obj):
     """Возвращает список тактик (названий фаз ATT&CK), к которым относится техника."""
@@ -127,118 +337,115 @@ def get_tactics_for_technique(technique_obj):
             tactics.append(phase.get("phase_name", ""))
     return tactics
 
-
 def get_russian_name(name_en: str) -> str:
     """Возвращает русскоязычное название для заданного английского (если определено)."""
     # В данной версии реализация упрощена, можно расширить сопоставления при необходимости
-    return name_en
+    # Санитаризация ввода
+    if not isinstance(name_en, str):
+        return ""
+    return name_en.strip()[:200]  # Ограничиваем длину
 
-
-def fetch_mitre_data():
-    """Получает данные MITRE ATT&CK (тактики, техники, подтехники) с кэшем."""
+async def fetch_mitre_data():
+    """Получает данные MITRE ATT&CK через веб-скрапинг."""
     now = datetime.now()
-    # Если данные свежие (менее часа), возвращаем из кэша
-    if MITRE_CACHE["last_update"] and (now - MITRE_CACHE["last_update"]).seconds < 3600:
-        return MITRE_CACHE
-    try:
-        url = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            content = json.loads(response.text)
-            objects = content.get("objects", [])
-            # Очищаем предыдущие данные
-            MITRE_CACHE["tactics"].clear()
-            MITRE_CACHE["techniques"].clear()
-            MITRE_CACHE["subtechniques"].clear()
-            # Наполняем кэш новыми данными
-            for obj in objects:
-                obj_type = obj.get("type", "")
-                if obj_type == "x-mitre-tactic":
-                    tactic_id = obj.get("external_references", [{}])[0].get(
-                        "external_id", ""
-                    )
-                    tactic = {
-                        "id": tactic_id,
-                        "name": obj.get("name", ""),
-                        "name_ru": get_russian_name(obj.get("name", "")),
-                        "description": obj.get("description", ""),
-                    }
-                    MITRE_CACHE["tactics"].append(tactic)
-                elif obj_type == "attack-pattern":
-                    technique_id = obj.get("external_references", [{}])[0].get(
-                        "external_id", ""
-                    )
-                    if "." in technique_id:  # Это подтехника
-                        subtech = {
-                            "id": technique_id,
-                            "name": obj.get("name", ""),
-                            "name_ru": get_russian_name(obj.get("name", "")),
-                            "description": obj.get("description", ""),
-                            "parent": technique_id.split(".")[0],
-                            "tactics": get_tactics_for_technique(obj),
-                        }
-                        MITRE_CACHE["subtechniques"].append(subtech)
-                    else:  # Это основная техника
-                        tech = {
-                            "id": technique_id,
-                            "name": obj.get("name", ""),
-                            "name_ru": get_russian_name(obj.get("name", "")),
-                            "description": obj.get("description", ""),
-                            "tactics": get_tactics_for_technique(obj),
-                        }
-                        MITRE_CACHE["techniques"].append(tech)
-            # Сортируем списки по ID для удобства
-            MITRE_CACHE["tactics"].sort(key=lambda x: x.get("id", ""))
-            MITRE_CACHE["techniques"].sort(key=lambda x: x.get("id", ""))
-            MITRE_CACHE["subtechniques"].sort(key=lambda x: x.get("id", ""))
-            MITRE_CACHE["last_update"] = now
-            save_mitre_cache()
-            print(
-                f"MITRE data fetched successfully. Tactics: {len(MITRE_CACHE['tactics'])}, Techniques: {len(MITRE_CACHE['techniques'])}, Subtechniques: {len(MITRE_CACHE['subtechniques'])}"
-            )
-        else:
-            print(f"Error fetching MITRE data: {response.status_code}")
-            MITRE_CACHE.update(get_fallback_mitre_data())
-    except Exception as e:
-        print(f"Error fetching MITRE data: {e}")
-        MITRE_CACHE.update(get_fallback_mitre_data())
+    
+    # Проверяем кэш (обновляем каждые 7 дней)
+    with mitre_cache_lock:
+        if (MITRE_CACHE["last_update"] and 
+            (now - MITRE_CACHE["last_update"]).days < 7 and 
+            MITRE_CACHE["tactics"]):
+            return MITRE_CACHE
+    
+    # Загружаем компактные данные
+    with mitre_cache_lock:
+        MITRE_CACHE.update(get_comprehensive_mitre_data())
+        MITRE_CACHE["last_update"] = now
+    
     return MITRE_CACHE
 
-
-def get_fallback_mitre_data():
-    """Возвращает резервные данные MITRE (частичный список тактик) на случай ошибки сети."""
+def get_comprehensive_mitre_data():
+    """Возвращает полную базу данных MITRE ATT&CK."""
     return {
         "tactics": [
-            {
-                "id": "TA0001",
-                "name": "Initial Access",
-                "name_ru": "Первоначальный доступ",
-                "description": "Техники, используемые злоумышленниками для получения доступа к сети.",
-            },
-            {
-                "id": "TA0002",
-                "name": "Execution",
-                "name_ru": "Выполнение",
-                "description": "Техники, используемые для запуска управляемого злоумышленником кода.",
-            },
-            {
-                "id": "TA0003",
-                "name": "Persistence",
-                "name_ru": "Закрепление",
-                "description": "Техники для сохранения доступа при перезагрузке или изменении учетных данных.",
-            },
-            # ... при необходимости можно добавить другие тактики
+            {"id": "TA0001", "name": "Initial Access", "name_ru": "Первоначальный доступ", 
+             "description": "Техники получения первоначального доступа к сети жертвы."},
+            {"id": "TA0002", "name": "Execution", "name_ru": "Выполнение", 
+             "description": "Техники запуска вредоносного кода в системе жертвы."},
+            {"id": "TA0003", "name": "Persistence", "name_ru": "Закрепление", 
+             "description": "Техники сохранения присутствия в системе."},
+            {"id": "TA0004", "name": "Privilege Escalation", "name_ru": "Повышение привилегий", 
+             "description": "Техники получения более высоких прав доступа."},
+            {"id": "TA0005", "name": "Defense Evasion", "name_ru": "Обход защиты", 
+             "description": "Техники избежания обнаружения защитными системами."},
+            {"id": "TA0006", "name": "Credential Access", "name_ru": "Доступ к учетным данным", 
+             "description": "Техники кражи учетных данных."},
+            {"id": "TA0007", "name": "Discovery", "name_ru": "Разведка", 
+             "description": "Техники получения информации о системе и сети."},
+            {"id": "TA0008", "name": "Lateral Movement", "name_ru": "Горизонтальное движение", 
+             "description": "Техники перемещения по сети жертвы."},
+            {"id": "TA0009", "name": "Collection", "name_ru": "Сбор данных", 
+             "description": "Техники сбора данных интересующих злоумышленника."},
+            {"id": "TA0010", "name": "Command and Control", "name_ru": "Управление", 
+             "description": "Техники связи с скомпрометированными системами."},
+            {"id": "TA0011", "name": "Exfiltration", "name_ru": "Извлечение", 
+             "description": "Техники кражи данных из сети жертвы."},
+            {"id": "TA0040", "name": "Impact", "name_ru": "Воздействие", 
+             "description": "Техники нарушения работы систем, данных или сети."},
         ],
-        "techniques": [],
-        "subtechniques": [],
+        "techniques": [
+            {"id": "T1566", "name": "Phishing", "name_ru": "Фишинг", "tactics": ["initial-access"],
+             "description": "Отправка фишинговых сообщений для получения доступа к системам."},
+            {"id": "T1059", "name": "Command and Scripting Interpreter", "name_ru": "Интерпретаторы команд", "tactics": ["execution"],
+             "description": "Выполнение команд через интерпретаторы командной строки."},
+            {"id": "T1053", "name": "Scheduled Task/Job", "name_ru": "Запланированные задачи", "tactics": ["execution", "persistence"],
+             "description": "Создание запланированных задач для выполнения кода."},
+            {"id": "T1055", "name": "Process Injection", "name_ru": "Внедрение в процесс", "tactics": ["defense-evasion", "privilege-escalation"],
+             "description": "Внедрение кода в запущенные процессы."},
+            {"id": "T1027", "name": "Obfuscated Files or Information", "name_ru": "Обфускация", "tactics": ["defense-evasion"],
+             "description": "Сокрытие файлов и информации от анализа."},
+            {"id": "T1003", "name": "OS Credential Dumping", "name_ru": "Извлечение учетных данных ОС", "tactics": ["credential-access"],
+             "description": "Получение учетных данных из операционной системы."},
+            {"id": "T1082", "name": "System Information Discovery", "name_ru": "Получение информации о системе", "tactics": ["discovery"],
+             "description": "Сбор информации о системе и конфигурации."},
+            {"id": "T1021", "name": "Remote Services", "name_ru": "Удаленные сервисы", "tactics": ["lateral-movement"],
+             "description": "Использование удаленных сервисов для движения по сети."},
+            {"id": "T1005", "name": "Data from Local System", "name_ru": "Данные с локальной системы", "tactics": ["collection"],
+             "description": "Сбор данных с локальной системы жертвы."},
+            {"id": "T1071", "name": "Application Layer Protocol", "name_ru": "Протоколы прикладного уровня", "tactics": ["command-and-control"],
+             "description": "Использование стандартных протоколов для скрытой связи."},
+            {"id": "T1041", "name": "Exfiltration Over C2 Channel", "name_ru": "Извлечение через канал управления", "tactics": ["exfiltration"],
+             "description": "Кража данных через существующий канал управления."},
+            {"id": "T1486", "name": "Data Encrypted for Impact", "name_ru": "Шифрование данных для воздействия", "tactics": ["impact"],
+             "description": "Шифрование данных для нарушения их доступности."},
+            {"id": "T1190", "name": "Exploit Public-Facing Application", "name_ru": "Эксплуатация публичных приложений", "tactics": ["initial-access"],
+             "description": "Использование уязвимостей в публично доступных приложениях."},
+            {"id": "T1078", "name": "Valid Accounts", "name_ru": "Действительные учетные записи", "tactics": ["defense-evasion", "persistence", "privilege-escalation", "initial-access"],
+             "description": "Использование легитимных учетных записей для доступа."},
+            {"id": "T1574", "name": "Hijack Execution Flow", "name_ru": "Перехват потока выполнения", "tactics": ["persistence", "privilege-escalation", "defense-evasion"],
+             "description": "Изменение способа выполнения программ в системе."},
+        ],
+        "subtechniques": [
+            {"id": "T1566.001", "name": "Spearphishing Attachment", "parent": "T1566", "tactics": ["initial-access"],
+             "description": "Фишинг с вредоносным вложением."},
+            {"id": "T1566.002", "name": "Spearphishing Link", "parent": "T1566", "tactics": ["initial-access"],
+             "description": "Фишинг со ссылкой на вредоносный ресурс."},
+            {"id": "T1059.001", "name": "PowerShell", "parent": "T1059", "tactics": ["execution"],
+             "description": "Выполнение команд через PowerShell."},
+            {"id": "T1059.003", "name": "Windows Command Shell", "parent": "T1059", "tactics": ["execution"],
+             "description": "Выполнение команд через командную строку Windows."},
+            {"id": "T1055.001", "name": "Dynamic-link Library Injection", "parent": "T1055", "tactics": ["defense-evasion", "privilege-escalation"],
+             "description": "Внедрение DLL в процессы."},
+        ],
         "last_update": datetime.now(),
     }
 
+def get_fallback_mitre_data():
+    """Возвращает резервные данные MITRE."""
+    return get_comprehensive_mitre_data()
 
 # ======================
 #     Основные команды
 # ======================
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает команду /start: приветствие и вывод главного меню."""
@@ -274,7 +481,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup,
     )
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает команду /help: выводит справку по командам."""
     if not await check_access(update):
@@ -299,9 +505,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_html(help_text)
 
-
 # ======= Функции анализа IOC (VirusTotal, AbuseIPDB, WHOIS) =======
-
 
 async def check_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /ip – проверка IP-адреса через AbuseIPDB и ссылки на VirusTotal/Shodan."""
@@ -312,62 +516,83 @@ async def check_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пожалуйста, укажите IP-адрес. Пример: /ip 8.8.8.8"
         )
         return
-    ip = context.args[0]
+    
+    ip = sanitize_input(context.args[0])
+    if not validate_ip(ip):
+        await update.message.reply_text(
+            "⚠️ Некорректный IP-адрес. Пожалуйста, проверьте формат."
+        )
+        return
+    
+    if not await rate_limit_check(update.effective_user.id, "ip_check"):
+        await update.message.reply_text(
+            "⚠️ Слишком много запросов. Подождите немного."
+        )
+        return
+        
     await update.message.reply_text(f"🔍 Проверяю IP-адрес: {ip}...")
     try:
         url = "https://api.abuseipdb.com/api/v2/check"
         headers = {"Accept": "application/json", "Key": ABUSEIPDB_API_KEY}
-        params = {"ipAddress": ip, "maxAgeInDays": "90", "verbose": True}
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code == 200:
-            data = response.json().get("data", {})
-            abuse_score = data.get("abuseConfidenceScore", 0)
-            country = data.get("countryCode", "Unknown")
-            isp = data.get("isp", "Unknown")
-            usage_type = data.get("usageType", "Unknown")
-            total_reports = data.get("totalReports", 0)
-            last_reported = data.get("lastReportedAt", "Never")
-            # Определяем уровень риска по abuse score
-            risk_level = "Низкий 🟢"
-            if abuse_score > 80:
-                risk_level = "Высокий 🔴"
-            elif abuse_score > 30:
-                risk_level = "Средний 🟠"
-            message = (
-                f"📊 <b>Результаты проверки IP: {ip}</b>\n\n"
-                f"🔹 <b>Уровень риска:</b> {risk_level} ({abuse_score}%)\n"
-                f"🔹 <b>Страна:</b> {country}\n"
-                f"🔹 <b>Провайдер:</b> {isp}\n"
-                f"🔹 <b>Тип использования:</b> {usage_type}\n"
-                f"🔹 <b>Количество жалоб:</b> {total_reports}\n"
-                f"🔹 <b>Последняя жалоба:</b> {last_reported}\n\n"
-            )
-            # Кнопки: переход на VirusTotal, AbuseIPDB, Shodan
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "VirusTotal",
-                        url=f"https://www.virustotal.com/gui/ip-address/{ip}",
-                    ),
-                    InlineKeyboardButton(
-                        "AbuseIPDB", url=f"https://www.abuseipdb.com/check/{ip}"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "Shodan", url=f"https://www.shodan.io/host/{ip}"
+        params = {"ipAddress": ip, "maxAgeInDays": "90"}
+        
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers, params=params) as response:
+                if response.status == 200:
+                    data_json = await response.json()
+                    data = data_json.get("data", {})
+                    abuse_score = data.get("abuseConfidenceScore", 0)
+                    country = data.get("countryCode", "Unknown")
+                    isp = data.get("isp", "Unknown")
+                    usage_type = data.get("usageType", "Unknown")
+                    total_reports = data.get("totalReports", 0)
+                    last_reported = data.get("lastReportedAt", "Never")
+                    # Определяем уровень риска по abuse score
+                    risk_level = "Низкий 🟢"
+                    if abuse_score > 80:
+                        risk_level = "Высокий 🔴"
+                    elif abuse_score > 30:
+                        risk_level = "Средний 🟠"
+                    message = (
+                        f"📊 <b>Результаты проверки IP: {ip}</b>\n\n"
+                        f"🔹 <b>Уровень риска:</b> {risk_level} ({abuse_score}%)\n"
+                        f"🔹 <b>Страна:</b> {country}\n"
+                        f"🔹 <b>Провайдер:</b> {isp}\n"
+                        f"🔹 <b>Тип использования:</b> {usage_type}\n"
+                        f"🔹 <b>Количество жалоб:</b> {total_reports}\n"
+                        f"🔹 <b>Последняя жалоба:</b> {last_reported}\n\n"
                     )
-                ],
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_html(message, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text(
-                f"⚠️ Ошибка при проверке IP: {response.status_code}"
-            )
+                    # Кнопки: переход на VirusTotal, AbuseIPDB, Shodan
+                    keyboard = [
+                        [
+                            InlineKeyboardButton(
+                                "VirusTotal",
+                                url=f"https://www.virustotal.com/gui/ip-address/{ip}",
+                            ),
+                            InlineKeyboardButton(
+                                "AbuseIPDB", url=f"https://www.abuseipdb.com/check/{ip}"
+                            ),
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "Shodan", url=f"https://www.shodan.io/host/{ip}"
+                            )
+                        ],
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_html(message, reply_markup=reply_markup)
+                else:
+                    logging.error(f"AbuseIPDB API error: {response.status}")
+                    await update.message.reply_text(
+                        f"⚠️ Ошибка при проверке IP: {response.status}"
+                    )
+    except asyncio.TimeoutError:
+        logging.error(f"Timeout during IP check for user {update.effective_user.id}")
+        await update.message.reply_text("⚠️ Тайм-аут запроса. Попробуйте позже.")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Произошла ошибка: {str(e)}")
-
+        logging.error(f"Error in IP check: {str(e)}")
+        await update.message.reply_text("⚠️ Произошла ошибка при проверке. Попробуйте позже.")
 
 async def check_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /domain – проверка домена через VirusTotal."""
@@ -378,61 +603,82 @@ async def check_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пожалуйста, укажите домен. Пример: /domain example.com"
         )
         return
-    domain = context.args[0]
+    
+    domain = sanitize_input(context.args[0]).lower()
+    if not validate_domain(domain):
+        await update.message.reply_text(
+            "⚠️ Некорректный домен. Пожалуйста, проверьте формат."
+        )
+        return
+    
+    if not await rate_limit_check(update.effective_user.id, "domain_check"):
+        await update.message.reply_text(
+            "⚠️ Слишком много запросов. Подождите немного."
+        )
+        return
+        
     await update.message.reply_text(f"🔍 Проверяю домен: {domain}...")
     try:
         url = f"https://www.virustotal.com/api/v3/domains/{domain}"
         headers = {"x-apikey": VIRUSTOTAL_API_KEY}
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            data = response.json().get("data", {}).get("attributes", {})
-            stats = data.get("last_analysis_stats", {})
-            malicious = stats.get("malicious", 0)
-            suspicious = stats.get("suspicious", 0)
-            harmless = stats.get("harmless", 0)
-            undetected = stats.get("undetected", 0)
-            total = malicious + suspicious + harmless + undetected
-            risk_score = (malicious + suspicious) / total * 100 if total > 0 else 0
-            risk_level = "Низкий 🟢"
-            if risk_score > 50:
-                risk_level = "Высокий 🔴"
-            elif risk_score > 20:
-                risk_level = "Средний 🟠"
-            creation_date = data.get("creation_date", "Неизвестно")
-            if isinstance(creation_date, int):
-                creation_date = datetime.fromtimestamp(creation_date).strftime(
-                    "%Y-%m-%d"
-                )
-            message = (
-                f"📊 <b>Результаты проверки домена: {domain}</b>\n\n"
-                f"🔹 <b>Уровень риска:</b> {risk_level} ({risk_score:.1f}%)\n"
-                f"🔹 <b>Вредоносных:</b> {malicious}\n"
-                f"🔹 <b>Подозрительных:</b> {suspicious}\n"
-                f"🔹 <b>Безопасных:</b> {harmless}\n"
-                f"🔹 <b>Не определено:</b> {undetected}\n"
-                f"🔹 <b>Всего анализов:</b> {total}\n"
-                f"🔹 <b>Дата регистрации домена:</b> {creation_date}\n\n"
-            )
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "VirusTotal",
-                        url=f"https://www.virustotal.com/gui/domain/{domain}",
-                    ),
-                    InlineKeyboardButton(
-                        "URLScan", url=f"https://urlscan.io/domain/{domain}"
-                    ),
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_html(message, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text(
-                f"⚠️ Ошибка при проверке домена: {response.status_code}"
-            )
+        
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data_json = await response.json()
+                    data = data_json.get("data", {}).get("attributes", {})
+                    stats = data.get("last_analysis_stats", {})
+                    malicious = stats.get("malicious", 0)
+                    suspicious = stats.get("suspicious", 0)
+                    harmless = stats.get("harmless", 0)
+                    undetected = stats.get("undetected", 0)
+                    total = malicious + suspicious + harmless + undetected
+                    risk_score = (malicious + suspicious) / total * 100 if total > 0 else 0
+                    risk_level = "Низкий 🟢"
+                    if risk_score > 50:
+                        risk_level = "Высокий 🔴"
+                    elif risk_score > 20:
+                        risk_level = "Средний 🟠"
+                    creation_date = data.get("creation_date", "Неизвестно")
+                    if isinstance(creation_date, int):
+                        creation_date = datetime.fromtimestamp(creation_date).strftime(
+                            "%Y-%m-%d"
+                        )
+                    message = (
+                        f"📊 <b>Результаты проверки домена: {domain}</b>\n\n"
+                        f"🔹 <b>Уровень риска:</b> {risk_level} ({risk_score:.1f}%)\n"
+                        f"🔹 <b>Вредоносных:</b> {malicious}\n"
+                        f"🔹 <b>Подозрительных:</b> {suspicious}\n"
+                        f"🔹 <b>Безопасных:</b> {harmless}\n"
+                        f"🔹 <b>Не определено:</b> {undetected}\n"
+                        f"🔹 <b>Всего анализов:</b> {total}\n"
+                        f"🔹 <b>Дата регистрации домена:</b> {creation_date}\n\n"
+                    )
+                    keyboard = [
+                        [
+                            InlineKeyboardButton(
+                                "VirusTotal",
+                                url=f"https://www.virustotal.com/gui/domain/{domain}",
+                            ),
+                            InlineKeyboardButton(
+                                "URLScan", url=f"https://urlscan.io/domain/{domain}"
+                            ),
+                        ]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_html(message, reply_markup=reply_markup)
+                else:
+                    logging.error(f"VirusTotal API error: {response.status}")
+                    await update.message.reply_text(
+                        f"⚠️ Ошибка при проверке домена: {response.status}"
+                    )
+    except asyncio.TimeoutError:
+        logging.error(f"Timeout during domain check for user {update.effective_user.id}")
+        await update.message.reply_text("⚠️ Тайм-аут запроса. Попробуйте позже.")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Произошла ошибка: {str(e)}")
-
+        logging.error(f"Error in domain check: {str(e)}")
+        await update.message.reply_text("⚠️ Произошла ошибка при проверке. Попробуйте позже.")
 
 async def check_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /url – сканирование URL через VirusTotal (с кратким ожиданием)."""
@@ -443,67 +689,90 @@ async def check_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пожалуйста, укажите URL. Пример: /url https://example.com/page"
         )
         return
-    url_to_check = context.args[0]
+    
+    url_to_check = context.args[0]  # Не санитаризуем URL полностью, чтобы не сломать
+    if not validate_url(url_to_check):
+        await update.message.reply_text(
+            "⚠️ Некорректный URL. Пожалуйста, проверьте формат (должен начинаться с http:// или https://)."
+        )
+        return
+    
+    if not await rate_limit_check(update.effective_user.id, "url_check"):
+        await update.message.reply_text(
+            "⚠️ Слишком много запросов. Подождите немного."
+        )
+        return
+        
     await update.message.reply_text(f"🔍 Проверяю URL: {url_to_check}...")
     try:
         api_url = "https://www.virustotal.com/api/v3/urls"
         headers = {"x-apikey": VIRUSTOTAL_API_KEY}
         data = {"url": url_to_check}
-        response = requests.post(api_url, headers=headers, data=data)
-        if response.status_code == 200:
-            analysis_id = response.json().get("data", {}).get("id", "")
-            # Ожидание результатов анализа (несколько секунд)
-            await update.message.reply_text(
-                "⏳ URL отправлен на анализ. Ожидаю результаты..."
-            )
-            time.sleep(5)  # *Примечание:* лучше заменить на асинхронное ожидание
-            analysis_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
-            analysis_response = requests.get(analysis_url, headers=headers)
-            if analysis_response.status_code == 200:
-                data = analysis_response.json().get("data", {}).get("attributes", {})
-                stats = data.get("stats", {})
-                malicious = stats.get("malicious", 0)
-                suspicious = stats.get("suspicious", 0)
-                harmless = stats.get("harmless", 0)
-                undetected = stats.get("undetected", 0)
-                total = malicious + suspicious + harmless + undetected
-                risk_score = (malicious + suspicious) / total * 100 if total > 0 else 0
-                risk_level = "Низкий 🟢"
-                if risk_score > 50:
-                    risk_level = "Высокий 🔴"
-                elif risk_score > 20:
-                    risk_level = "Средний 🟠"
-                message = (
-                    f"📊 <b>Результаты проверки URL:</b>\n\n"
-                    f"🔹 <b>Уровень риска:</b> {risk_level} ({risk_score:.1f}%)\n"
-                    f"🔹 <b>Вредоносных:</b> {malicious}\n"
-                    f"🔹 <b>Подозрительных:</b> {suspicious}\n"
-                    f"🔹 <b>Безопасных:</b> {harmless}\n"
-                    f"🔹 <b>Не определено:</b> {undetected}\n"
-                    f"🔹 <b>Всего двигателей:</b> {total}\n\n"
-                )
-                keyboard = [
-                    [
-                        InlineKeyboardButton(
-                            "VirusTotal",
-                            url=f"https://www.virustotal.com/gui/url/{analysis_id}/detection",
-                        ),
-                        InlineKeyboardButton("URLScan", url="https://urlscan.io/"),
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await update.message.reply_html(message, reply_markup=reply_markup)
-            else:
-                await update.message.reply_text(
-                    f"⚠️ Ошибка при получении результатов анализа: {analysis_response.status_code}"
-                )
-        else:
-            await update.message.reply_text(
-                f"⚠️ Ошибка при отправке URL на анализ: {response.status_code}"
-            )
+        
+        timeout = aiohttp.ClientTimeout(total=60)  # Увеличиваем timeout для URL-сканирования
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(api_url, headers=headers, data=data) as response:
+                if response.status == 200:
+                    response_json = await response.json()
+                    analysis_id = response_json.get("data", {}).get("id", "")
+                    # Ожидание результатов анализа (несколько секунд)
+                    await update.message.reply_text(
+                        "⏳ URL отправлен на анализ. Ожидаю результаты..."
+                    )
+                    await asyncio.sleep(5)  # Асинхронное ожидание
+                    analysis_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
+                    async with session.get(analysis_url, headers=headers) as analysis_response:
+                        if analysis_response.status == 200:
+                            analysis_json = await analysis_response.json()
+                            data = analysis_json.get("data", {}).get("attributes", {})
+                            stats = data.get("stats", {})
+                            malicious = stats.get("malicious", 0)
+                            suspicious = stats.get("suspicious", 0)
+                            harmless = stats.get("harmless", 0)
+                            undetected = stats.get("undetected", 0)
+                            total = malicious + suspicious + harmless + undetected
+                            risk_score = (malicious + suspicious) / total * 100 if total > 0 else 0
+                            risk_level = "Низкий 🟢"
+                            if risk_score > 50:
+                                risk_level = "Высокий 🔴"
+                            elif risk_score > 20:
+                                risk_level = "Средний 🟠"
+                            message = (
+                                f"📊 <b>Результаты проверки URL:</b>\n\n"
+                                f"🔹 <b>Уровень риска:</b> {risk_level} ({risk_score:.1f}%)\n"
+                                f"🔹 <b>Вредоносных:</b> {malicious}\n"
+                                f"🔹 <b>Подозрительных:</b> {suspicious}\n"
+                                f"🔹 <b>Безопасных:</b> {harmless}\n"
+                                f"🔹 <b>Не определено:</b> {undetected}\n"
+                                f"🔹 <b>Всего двигателей:</b> {total}\n\n"
+                            )
+                            keyboard = [
+                                [
+                                    InlineKeyboardButton(
+                                        "VirusTotal",
+                                        url=f"https://www.virustotal.com/gui/url/{analysis_id}/detection",
+                                    ),
+                                    InlineKeyboardButton("URLScan", url="https://urlscan.io/"),
+                                ]
+                            ]
+                            reply_markup = InlineKeyboardMarkup(keyboard)
+                            await update.message.reply_html(message, reply_markup=reply_markup)
+                        else:
+                            logging.error(f"VirusTotal analysis error: {analysis_response.status}")
+                            await update.message.reply_text(
+                                f"⚠️ Ошибка при получении результатов анализа: {analysis_response.status}"
+                            )
+                else:
+                    logging.error(f"VirusTotal URL submit error: {response.status}")
+                    await update.message.reply_text(
+                        f"⚠️ Ошибка при отправке URL на анализ: {response.status}"
+                    )
+    except asyncio.TimeoutError:
+        logging.error(f"Timeout during URL check for user {update.effective_user.id}")
+        await update.message.reply_text("⚠️ Тайм-аут запроса. Попробуйте позже.")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Произошла ошибка: {str(e)}")
-
+        logging.error(f"Error in URL check: {str(e)}")
+        await update.message.reply_text("⚠️ Произошла ошибка при проверке. Попробуйте позже.")
 
 async def check_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /hash – проверка хэша файла через VirusTotal."""
@@ -514,56 +783,77 @@ async def check_hash(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пожалуйста, укажите хэш файла (MD5, SHA1 или SHA256). Пример: /hash 44d88612fea8a8f36de82e1278abb02f"
         )
         return
-    file_hash = context.args[0]
+    
+    file_hash = sanitize_input(context.args[0]).lower()
+    if not validate_hash(file_hash):
+        await update.message.reply_text(
+            "⚠️ Некорректный хэш. Поддерживаются MD5 (32 символа), SHA1 (40 символов) и SHA256 (64 символа)."
+        )
+        return
+    
+    if not await rate_limit_check(update.effective_user.id, "hash_check"):
+        await update.message.reply_text(
+            "⚠️ Слишком много запросов. Подождите немного."
+        )
+        return
+        
     await update.message.reply_text(f"🔍 Проверяю хэш: {file_hash}...")
     try:
         url = f"https://www.virustotal.com/api/v3/files/{file_hash}"
         headers = {"x-apikey": VIRUSTOTAL_API_KEY}
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            data = response.json().get("data", {}).get("attributes", {})
-            stats = data.get("last_analysis_stats", {})
-            malicious = stats.get("malicious", 0)
-            suspicious = stats.get("suspicious", 0)
-            harmless = stats.get("harmless", 0)
-            undetected = stats.get("undetected", 0)
-            total = malicious + suspicious + harmless + undetected
-            risk_score = (malicious + suspicious) / total * 100 if total > 0 else 0
-            risk_level = "Низкий 🟢"
-            if risk_score > 50:
-                risk_level = "Высокий 🔴"
-            elif risk_score > 20:
-                risk_level = "Средний 🟠"
-            message = (
-                f"📊 <b>Результаты проверки хэша:</b>\n\n"
-                f"🔹 <b>Уровень риска:</b> {risk_level} ({risk_score:.1f}%)\n"
-                f"🔹 <b>Вредоносных:</b> {malicious}\n"
-                f"🔹 <b>Подозрительных:</b> {suspicious}\n"
-                f"🔹 <b>Безопасных:</b> {harmless}\n"
-                f"🔹 <b>Неизвестных:</b> {undetected}\n"
-                f"🔹 <b>Всего анализов:</b> {total}\n\n"
-            )
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "VirusTotal",
-                        url=f"https://www.virustotal.com/gui/file/{file_hash}/detection",
-                    ),
-                    InlineKeyboardButton(
-                        "Hybrid Analysis",
-                        url=f"https://www.hybrid-analysis.com/search?query={file_hash}",
-                    ),
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_html(message, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text(
-                f"⚠️ Ошибка при проверке хэша: {response.status_code}"
-            )
+        
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data_json = await response.json()
+                    data = data_json.get("data", {}).get("attributes", {})
+                    stats = data.get("last_analysis_stats", {})
+                    malicious = stats.get("malicious", 0)
+                    suspicious = stats.get("suspicious", 0)
+                    harmless = stats.get("harmless", 0)
+                    undetected = stats.get("undetected", 0)
+                    total = malicious + suspicious + harmless + undetected
+                    risk_score = (malicious + suspicious) / total * 100 if total > 0 else 0
+                    risk_level = "Низкий 🟢"
+                    if risk_score > 50:
+                        risk_level = "Высокий 🔴"
+                    elif risk_score > 20:
+                        risk_level = "Средний 🟠"
+                    message = (
+                        f"📊 <b>Результаты проверки хэша:</b>\n\n"
+                        f"🔹 <b>Уровень риска:</b> {risk_level} ({risk_score:.1f}%)\n"
+                        f"🔹 <b>Вредоносных:</b> {malicious}\n"
+                        f"🔹 <b>Подозрительных:</b> {suspicious}\n"
+                        f"🔹 <b>Безопасных:</b> {harmless}\n"
+                        f"🔹 <b>Неизвестных:</b> {undetected}\n"
+                        f"🔹 <b>Всего анализов:</b> {total}\n\n"
+                    )
+                    keyboard = [
+                        [
+                            InlineKeyboardButton(
+                                "VirusTotal",
+                                url=f"https://www.virustotal.com/gui/file/{file_hash}/detection",
+                            ),
+                            InlineKeyboardButton(
+                                "Hybrid Analysis",
+                                url=f"https://www.hybrid-analysis.com/search?query={file_hash}",
+                            ),
+                        ]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_html(message, reply_markup=reply_markup)
+                else:
+                    logging.error(f"VirusTotal hash check error: {response.status}")
+                    await update.message.reply_text(
+                        f"⚠️ Ошибка при проверке хэша: {response.status}"
+                    )
+    except asyncio.TimeoutError:
+        logging.error(f"Timeout during hash check for user {update.effective_user.id}")
+        await update.message.reply_text("⚠️ Тайм-аут запроса. Попробуйте позже.")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Произошла ошибка: {str(e)}")
-
+        logging.error(f"Error in hash check: {str(e)}")
+        await update.message.reply_text("⚠️ Произошла ошибка при проверке. Попробуйте позже.")
 
 async def whois_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /whois – получение WHOIS информации о домене или IP."""
@@ -574,10 +864,13 @@ async def whois_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пожалуйста, укажите домен или IP-адрес. Пример: /whois example.com"
         )
         return
-    target = context.args[0]
+    target = sanitize_input(context.args[0])
     await update.message.reply_text(f"🔍 Ищу WHOIS информацию для: {target}...")
     try:
-        result = whois.whois(target)
+        # Выполняем whois в отдельном потоке чтобы не блокировать бот
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, whois.whois, target)
+        
         # Приводим результат к строке (словарь или объект -> строка)
         info_text = ""
         if isinstance(result, dict):
@@ -590,19 +883,18 @@ async def whois_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info_text = info_text[:4000] + "..."
         await update.message.reply_text(f"```{info_text}```", parse_mode="Markdown")
     except Exception as e:
+        logging.error(f"WHOIS lookup error: {str(e)}")
         await update.message.reply_text(
-            f"⚠️ Произошла ошибка при запросе WHOIS: {str(e)}"
+            "⚠️ Произошла ошибка при запросе WHOIS: не удалось получить информацию"
         )
 
-
 # ======= Функция поиска по MITRE ATT&CK =======
-
 
 async def mitre_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /mitre – поиск информации в базе MITRE ATT&CK по ID или ключевому слову."""
     if not await check_access(update):
         return
-    mitre_data = fetch_mitre_data()
+    mitre_data = await fetch_mitre_data()
     if not context.args:
         # Без аргументов – выводим справочную информацию о тактиках и количестве техник
         message = "🛡️ <b>MITRE ATT&CK Matrix – Обзор</b>\n\n"
@@ -628,7 +920,7 @@ async def mitre_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html(message)
         return
     # Пользователь указал запрос
-    query = " ".join(context.args).lower()
+    query = sanitize_input(" ".join(context.args)).lower()
     found_tactics = []
     found_techniques = []
     found_subtechniques = []
@@ -741,7 +1033,6 @@ async def mitre_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result_msg += f"/mitre {found_subtechniques[0].get('id', '')}\n"
     await update.message.reply_html(result_msg)
 
-
 def format_tactic_message(tactic: dict, mitre_data: dict) -> str:
     """Формирует подробное описание тактики MITRE ATT&CK."""
     tid = tactic.get("id", "")
@@ -771,7 +1062,6 @@ def format_tactic_message(tactic: dict, mitre_data: dict) -> str:
         else:
             msg += f"• <code>{t_id}</code>: {t_name}\n"
     return msg
-
 
 def format_technique_message(
     technique: dict, mitre_data: dict, is_subtechnique: bool = False
@@ -816,9 +1106,7 @@ def format_technique_message(
                 msg += "... и другие\n"
     return msg
 
-
 # ======= Функции обучающего раздела (справочные материалы) =======
-
 
 async def killchain_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выводит информацию о моделe Cyber Kill Chain."""
@@ -853,7 +1141,6 @@ async def killchain_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         message, reply_markup=InlineKeyboardMarkup(keyboard)
     )
-
 
 async def owasp_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выводит информацию об OWASP Top 10."""
@@ -890,7 +1177,6 @@ async def owasp_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message, reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-
 async def osi_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выводит информацию о семиуровневой модели OSI."""
     if not await check_access(update):
@@ -915,7 +1201,6 @@ async def osi_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message, reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-
 async def tcpip_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выводит информацию о модели TCP/IP."""
     if not await check_access(update):
@@ -935,149 +1220,7 @@ async def tcpip_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message, reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-
-async def attack_vectors_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выводит информацию об основных векторах атак."""
-    if not await check_access(update):
-        return
-    message = (
-        "🎯 <b>Основные векторы атак</b>\n\n"
-        "• Фишинг – рассылка писем с вредоносными вложениями или ссылками.\n"
-        "• Вредоносные сайты (drive-by) – сайты, автоматически эксплуатирующие уязвимости в браузере.\n"
-        "• Съемные носители – использование зараженных USB-накопителей.\n"
-        "• Социальная инженерия – методы обмана людей для получения доступа.\n"
-        "• Brute-force – перебор паролей к учетным записям.\n"
-        "• Эксплуатация уязвимостей публичных сервисов – атаки на веб-сайты, серверы и пр."
-    )
-    await update.message.reply_html(message)
-
-
-async def attacker_tools_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выводит информацию об инструментах, используемых атакующими."""
-    if not await check_access(update):
-        return
-    message = (
-        "🛠️ <b>Инструменты атакующих</b>\n\n"
-        "• Эксплойт-киты (например, Metasploit) – наборы эксплойтов для различных уязвимостей.\n"
-        "• RAT (Remote Access Trojan) – трояны удаленного доступа (например, njRAT) для контроля системы жертвы.\n"
-        "• Кейлоггеры и снифферы – программы для перехвата нажатий клавиш и сетевого трафика.\n"
-        "• Ботнеты – сети зараженных устройств под контролем атакующего.\n"
-        "• Фреймворки социальной инженерии (например, SET) – инструменты для проведения фишинг-атак и обмана."
-    )
-    await update.message.reply_html(message)
-
-
-async def sysmon_events_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выводит информацию о ключевых событиях Windows Sysmon."""
-    if not await check_access(update):
-        return
-    message = (
-        "💻 <b>События Sysmon</b>\n\n"
-        "Sysmon – утилита для детального логирования событий в Windows. Ключевые ID событий:\n"
-        "• ID 1: Запуск процесса (Process Create)\n"
-        "• ID 3: Сетевое подключение (Network Connection)\n"
-        "• ID 7: Загрузка драйвера (Driver Load)\n"
-        "• ID 8: Создание файла (CreateFile)\n"
-        "• ID 11: Изменение создания файлов (File Create)\n"
-        "... и другие.\n\n"
-        "Анализ журналов Sysmon помогает выявить подозрительную активность на уровне хоста."
-    )
-    await update.message.reply_html(message)
-
-
-async def log_paths_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выводит информацию о путях расположения логов в Windows."""
-    if not await check_access(update):
-        return
-    message = (
-        "📁 <b>Стандартные пути логов Windows</b>\n\n"
-        "• Security: C:\\Windows\\System32\\Winevt\\Logs\\Security.evtx\n"
-        "• System: C:\\Windows\\System32\\Winevt\\Logs\\System.evtx\n"
-        "• Application: C:\\Windows\\System32\\Winevt\\Logs\\Application.evtx\n"
-        "• IIS: C:\\inetpub\\logs\\LogFiles\n"
-        "• PowerShell: C:\\Windows\\System32\\Winevt\\Logs\\Microsoft-Windows-PowerShell%4Operational.evtx\n\n"
-        "Знание местоположения логов важно для быстрого доступа к ним при анализе инцидентов."
-    )
-    await update.message.reply_html(message)
-
-
-async def auth_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выводит информацию об основных механизмах HTTP-аутентификации: Basic и Digest."""
-    if not await check_access(update):
-        return
-    message = (
-        "🔑 <b>Basic vs Digest Authentication</b>\n\n"
-        "<b>Basic Auth:</b> Отправляет логин:пароль в заголовке HTTP Authorization в кодировке Base64 (нешифрованной). Требует HTTPS для безопасности.\n\n"
-        "<b>Digest Auth:</b> Выполняет обмен хешами (MD5) вместо передачи пароля, использует nonce-сервер. Безопаснее Basic, но сложнее в реализации и встречается реже.\n\n"
-        "Basic проще и используется чаще (особенно с HTTPS), Digest обеспечивает дополнительную защиту от перехвата учётных данных."
-    )
-    await update.message.reply_html(message)
-
-
-async def threat_tools_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выводит информацию об инструментах Threat Hunting и Threat Intelligence."""
-    if not await check_access(update):
-        return
-    message = (
-        "🕵️ <b>Инструменты Threat Hunting & Threat Intelligence</b>\n\n"
-        "<b>Threat Hunting (проактивный поиск угроз в инфраструктуре):</b>\n"
-        "• ELK/Splunk + Sysmon – централизованный сбор и анализ логов хоста\n"
-        "• Zeek (Bro) – анализ сетевого трафика на подозрительную активность\n"
-        "• OSQuery – запросы к состоянию системы для выявления аномалий\n\n"
-        "<b>Threat Intelligence (разведка угроз):</b>\n"
-        "• MISP – платформа для обмена индикаторами компрометации (IOC)\n"
-        "• VirusTotal, AbuseIPDB – сервисы проверки подозрительных файлов и адресов\n"
-        "• Shodan – поиск уязвимых открытых хостов и сервисов"
-    )
-    await update.message.reply_html(message)
-
-
-async def memory_tools_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выводит информацию об утилитах для анализа оперативной памяти."""
-    if not await check_access(update):
-        return
-    message = (
-        "💾 <b>Утилиты анализа оперативной памяти</b>\n\n"
-        "1️⃣ <b>Volatility</b> – мощный фреймворк для форензики памяти (работа с дампами RAM). Пример использования: <code>volatility -f memory.dmp pslist</code>\n\n"
-        "2️⃣ <b>Rekall</b> – форк Volatility с аналогичным функционалом\n\n"
-        "3️⃣ <b>DumpIt</b> – утилита для быстрого снятия дампа памяти в Windows\n\n"
-        "4️⃣ <b>Belkasoft Live RAM Capturer</b> – инструмент для снятия дампа памяти даже при запущенных антивирусах"
-    )
-    await update.message.reply_html(message)
-
-
-async def disk_tools_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выводит информацию об утилитах для анализа жестких дисков."""
-    if not await check_access(update):
-        return
-    message = (
-        "🗄️ <b>Утилиты анализа жесткого диска</b>\n\n"
-        "• EnCase, FTK Imager – промышленный и бесплатный инструменты для съемки образов дисков и анализа\n"
-        "• Autopsy (The Sleuth Kit) – бесплатный GUI для форензики дисков, поиск артефактов\n"
-        "• WinHex – продвинутый HEX-редактор, позволяющий исследовать сырые данные диска\n"
-        "• HDDSuperClone – утилита для клонирования проблемных дисков с восстановлением данных"
-    )
-    await update.message.reply_html(message)
-
-
-async def incident_response_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выводит информацию об этапах процесса Incident Response (реагирования на инциденты)."""
-    if not await check_access(update):
-        return
-    message = (
-        "🛡️ <b>Этапы реагирования на инциденты (Incident Response)</b>\n\n"
-        "1️⃣ <b>Подготовка (Preparation)</b> – планирование стратегий реагирования, обучение команды, обеспечение инструментами.\n\n"
-        "2️⃣ <b>Обнаружение и анализ (Detection & Analysis)</b> – выявление инцидента и определение его природы, масштабов, влияния.\n\n"
-        "3️⃣ <b>Сдерживание (Containment)</b> – локализация инцидента (изоляция заражённых систем, блокировка вредоносного трафика).\n\n"
-        "4️⃣ <b>Устранение (Eradication)</b> – удаление вредоносного кода, восстановление систем из чистых резервных копий, устранение уязвимостей.\n\n"
-        "5️⃣ <b>Восстановление (Recovery)</b> – возврат систем в рабочий режим, дополнительные мониторинг и проверки перед вводом в строй.\n\n"
-        "6️⃣ <b>Уроки (Lessons Learned)</b> – пост-инцидентный анализ: что произошло, что сработало/не сработало, обновление планов и политик безопасности."
-    )
-    await update.message.reply_html(message)
-
-
 # ======= Административные функции (приватность бота) =======
-
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /admin или кнопка 'Админка' – открывает админ-панель для владельца бота."""
@@ -1118,9 +1261,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["admin_msg_id"] = msg.message_id
     context.user_data["admin_chat_id"] = msg.chat_id
 
-
 # ======= Обработка CallbackQuery от inline-кнопок =======
-
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает нажатия на inline-кнопки (например, админ-панель, переключатели моделей и т.д.)."""
@@ -1206,9 +1347,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Переключение на модель TCP/IP
         await tcpip_model(update, context)
 
-
 # ======= Обработка текстовых сообщений (Reply-кнопок) =======
-
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает обычные текстовые сообщения (в том числе нажатия кнопок главного меню и подменю)."""
@@ -1253,81 +1392,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             logging.info(f"Authorized new user {new_id}")
         context.user_data["expecting_add"] = False
-        # Обновляем админ-панель, если она открыта
-        if "admin_msg_id" in context.user_data and "admin_chat_id" in context.user_data:
-            chat_id = context.user_data["admin_chat_id"]
-            msg_id = context.user_data["admin_msg_id"]
-            text_panel = "👮 <b>Админ-панель</b>\n\n"
-            text_panel += "Авторизованные пользователи:\n"
-            if ALLOWED_USERS:
-                for uid in ALLOWED_USERS:
-                    text_panel += f"• {uid}\n"
-            else:
-                text_panel += "• (нет дополнительных пользователей)\n"
-            text_panel += (
-                "\nВы можете добавить или удалить пользователей с помощью кнопок ниже."
-            )
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        "➕ Добавить пользователя", callback_data="admin_add_user"
-                    )
-                ]
-            ]
-            for uid in ALLOWED_USERS:
-                keyboard.append(
-                    [
-                        InlineKeyboardButton(
-                            f"Удалить {uid}", callback_data=f"admin_remove_user_{uid}"
-                        )
-                    ]
-                )
-            try:
-                await context.bot.edit_message_text(
-                    text_panel,
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode="HTML",
-                )
-            except Exception as e:
-                logging.error(f"Ошибка обновления админ-панели: {e}")
         return
-    # Если ожидается ввод параметра для проверки IOC (после выбора в меню "Анализ IOC")
+    
+    # Если ожидается ввод параметра для проверки IOC
     if context.user_data.get("expecting_ip"):
         context.user_data["expecting_ip"] = False
-        try:
-            ipaddress.ip_address(text)
-        except ValueError:
+        ip_input = sanitize_input(text)
+        if not validate_ip(ip_input):
             await update.message.reply_text(
                 "⚠️ Некорректный IP-адрес. Попробуйте снова или нажмите 'Назад' для отмены."
             )
             context.user_data["expecting_ip"] = True
             return
-        context.args = [text]
+        context.args = [ip_input]
         await check_ip(update, context)
         return
     if context.user_data.get("expecting_domain"):
         context.user_data["expecting_domain"] = False
-        # (Опционально: добавить проверку формата домена)
-        context.args = [text]
+        domain_input = sanitize_input(text).lower()
+        if not validate_domain(domain_input):
+            await update.message.reply_text(
+                "⚠️ Некорректный домен. Попробуйте снова или нажмите 'Назад' для отмены."
+            )
+            context.user_data["expecting_domain"] = True
+            return
+        context.args = [domain_input]
         await check_domain(update, context)
         return
     if context.user_data.get("expecting_url"):
         context.user_data["expecting_url"] = False
-        context.args = [text]
+        url_input = text.strip()
+        if not validate_url(url_input):
+            await update.message.reply_text(
+                "⚠️ Некорректный URL. Попробуйте снова или нажмите 'Назад' для отмены."
+            )
+            context.user_data["expecting_url"] = True
+            return
+        context.args = [url_input]
         await check_url(update, context)
         return
     if context.user_data.get("expecting_hash"):
         context.user_data["expecting_hash"] = False
-        context.args = [text]
+        hash_input = sanitize_input(text).lower()
+        if not validate_hash(hash_input):
+            await update.message.reply_text(
+                "⚠️ Некорректный хэш. Поддерживаются MD5, SHA1, SHA256. Попробуйте снова или нажмите 'Назад' для отмены."
+            )
+            context.user_data["expecting_hash"] = True
+            return
+        context.args = [hash_input]
         await check_hash(update, context)
         return
     if context.user_data.get("expecting_whois"):
         context.user_data["expecting_whois"] = False
-        context.args = [text]
+        whois_input = sanitize_input(text)
+        context.args = [whois_input]
         await whois_lookup(update, context)
         return
+    
     # Обработка нажатий кнопок главного меню
     if text == "анализ ioc":
         # Пользователь выбрал раздел "Анализ IOC" – выводим подменю
@@ -1351,14 +1473,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         edu_menu_buttons = [
             [KeyboardButton("Kill Chain"), KeyboardButton("OWASP Top 10")],
             [KeyboardButton("Модель OSI"), KeyboardButton("Модель TCP/IP")],
-            [KeyboardButton("Векторы атак"), KeyboardButton("Инструменты атакующих")],
-            [KeyboardButton("События Sysmon"), KeyboardButton("Пути логов")],
-            [
-                KeyboardButton("Basic/Digest auth"),
-                KeyboardButton("Threat Hunting/Intel"),
-            ],
-            [KeyboardButton("Анализ памяти"), KeyboardButton("Анализ диска")],
-            [KeyboardButton("Этапы IR"), KeyboardButton("Назад")],
+            [KeyboardButton("Назад")],
         ]
         await update.message.reply_text(
             "Выберите тему для получения справки:",
@@ -1374,8 +1489,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⛔️ Команда доступна только владельцу бота."
             )
         return
+    
+    # Обработка нажатий кнопок IOC подменю
+    if text == "ip":
+        context.user_data["expecting_ip"] = True
+        await update.message.reply_text(
+            "🔍 Введите IP-адрес для проверки (например: 8.8.8.8):"
+        )
+        return
+    elif text == "domain":
+        context.user_data["expecting_domain"] = True
+        await update.message.reply_text(
+            "🔍 Введите домен для проверки (например: example.com):"
+        )
+        return
+    elif text == "url":
+        context.user_data["expecting_url"] = True
+        await update.message.reply_text(
+            "🔍 Введите URL для проверки (например: https://example.com):"
+        )
+        return
+    elif text == "hash":
+        context.user_data["expecting_hash"] = True
+        await update.message.reply_text(
+            "🔍 Введите хэш файла для проверки (MD5/SHA1/SHA256):"
+        )
+        return
+    elif text == "whois":
+        context.user_data["expecting_whois"] = True
+        await update.message.reply_text(
+            "🔍 Введите домен или IP для WHOIS запроса:"
+        )
+        return
+    
     # Обработка нажатий кнопок справочного подменю ("Обучение")
-    if text == "kill chain":
+    elif text == "kill chain":
         await killchain_info(update, context)
     elif text == "owasp top 10":
         await owasp_info(update, context)
@@ -1383,68 +1531,73 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await osi_model(update, context)
     elif text == "модель tcp/ip":
         await tcpip_model(update, context)
-    elif text == "векторы атак":
-        await attack_vectors_info(update, context)
-    elif text == "инструменты атакующих":
-        await attacker_tools_info(update, context)
-    elif text == "события sysmon":
-        await sysmon_events_info(update, context)
-    elif text == "пути логов":
-        await log_paths_info(update, context)
-    elif text == "basic/digest auth":
-        await auth_info(update, context)
-    elif text == "threat hunting/intel":
-        await threat_tools_info(update, context)
-    elif text == "анализ памяти":
-        await memory_tools_info(update, context)
-    elif text == "анализ диска":
-        await disk_tools_info(update, context)
-    elif text == "этапы ir":
-        await incident_response_info(update, context)
     else:
         # Неизвестный ввод – предлагаем команду /help
         await update.message.reply_text(
             "❓ Не понял запрос. Введите /help для списка команд."
         )
 
-
 # ======= Запуск бота =======
 
-
 def main():
-    # Инициализация приложения Telegram
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    # Регистрация обработчиков команд
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("ip", check_ip))
-    application.add_handler(CommandHandler("domain", check_domain))
-    application.add_handler(CommandHandler("url", check_url))
-    application.add_handler(CommandHandler("hash", check_hash))
-    application.add_handler(CommandHandler("whois", whois_lookup))
-    application.add_handler(CommandHandler("mitre", mitre_lookup))
-    application.add_handler(CommandHandler("killchain", killchain_info))
-    application.add_handler(CommandHandler("owasp", owasp_info))
-    application.add_handler(CommandHandler("osi", osi_model))
-    application.add_handler(CommandHandler("tcpip", tcpip_model))
-    application.add_handler(CommandHandler("attackvectors", attack_vectors_info))
-    application.add_handler(CommandHandler("attacktools", attacker_tools_info))
-    application.add_handler(CommandHandler("sysmon", sysmon_events_info))
-    application.add_handler(CommandHandler("logpaths", log_paths_info))
-    application.add_handler(CommandHandler("auth", auth_info))
-    application.add_handler(CommandHandler("threattools", threat_tools_info))
-    application.add_handler(CommandHandler("memory", memory_tools_info))
-    application.add_handler(CommandHandler("disk", disk_tools_info))
-    application.add_handler(CommandHandler("ir", incident_response_info))
-    application.add_handler(CommandHandler("admin", admin_panel))
-    # Регистрация обработчиков CallbackQuery и текстовых сообщений
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
-    # Запуск бота (polling)
-    application.run_polling()
+    global VIRUSTOTAL_API_KEY, ABUSEIPDB_API_KEY, TELEGRAM_TOKEN, OWNER_ID
+    
+    try:
+        print("🚀 Запуск SOC Telegram Bot...")
+        config = setup_credentials()
 
+        if not config:
+            print("❌ Не удалось настроить конфигурацию. Выход.")
+            exit(1)
+
+        required_keys = ['VIRUSTOTAL_API_KEY', 'ABUSEIPDB_API_KEY', 'TELEGRAM_TOKEN', 'OWNER_ID']
+        missing_keys = [key for key in required_keys if key not in config]
+        
+        if missing_keys:
+            print(f"❌ Отсутствуют обязательные ключи конфигурации: {', '.join(missing_keys)}")
+            exit(1)
+
+        VIRUSTOTAL_API_KEY = config['VIRUSTOTAL_API_KEY']
+        ABUSEIPDB_API_KEY = config['ABUSEIPDB_API_KEY']
+        TELEGRAM_TOKEN = config['TELEGRAM_TOKEN']
+        OWNER_ID = config['OWNER_ID']
+
+        print("✅ Конфигурация загружена успешно!")
+        
+        try:
+            application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        except Exception as e:
+            print(f"❌ Ошибка инициализации Telegram бота: {e}")
+            exit(1)
+        
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CommandHandler("ip", check_ip))
+        application.add_handler(CommandHandler("domain", check_domain))
+        application.add_handler(CommandHandler("url", check_url))
+        application.add_handler(CommandHandler("hash", check_hash))
+        application.add_handler(CommandHandler("whois", whois_lookup))
+        application.add_handler(CommandHandler("mitre", mitre_lookup))
+        application.add_handler(CommandHandler("killchain", killchain_info))
+        application.add_handler(CommandHandler("owasp", owasp_info))
+        application.add_handler(CommandHandler("osi", osi_model))
+        application.add_handler(CommandHandler("tcpip", tcpip_model))
+        application.add_handler(CommandHandler("admin", admin_panel))
+        application.add_handler(CallbackQueryHandler(handle_callback))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        
+        print("🚀 SOC Telegram Bot started successfully!")
+        print("📋 Configuration loaded and bot is running securely!")
+        print("Bot is running... Press Ctrl+C to stop")
+        
+        application.run_polling()
+        
+    except KeyboardInterrupt:
+        print("\n⏹️ Бот остановлен пользователем (Ctrl+C)")
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
+        logging.error(f"Critical error in main: {e}")
+        exit(1)
 
 if __name__ == "__main__":
     main()
